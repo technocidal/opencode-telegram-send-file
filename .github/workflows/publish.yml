@@ -10,21 +10,23 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '24'
+
+      - name: Update npm (trusted publishing requires >= 11.5.1)
+        run: npm install -g npm@latest
 
       - name: Auto-increment patch version
         run: npm version patch --no-git-tag-version
 
-      - name: Publish to npm
+      - name: Publish to npm (via OIDC trusted publishing)
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Commit and push version bump
         run: |
