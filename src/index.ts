@@ -8,18 +8,20 @@
  * Zero config — binding resolution, retry logic, and multi-identity fan-out
  * are all handled by the router.
  *
- * Port discovery (pure fetch, no child_process — works in Bun plugin sandbox):
+ * Port discovery (in order):
  *   1. OPENCODE_ROUTER_HEALTH_PORT env var
- *   2. Discover orchestrator port, read its opencode port, then probe
- *      a ±50 window for a host with router-shaped /health response
- *   3. Fallback to 3005
+ *   2. ~/.openwork/opencode-router/port file (written by router on startup)
+ *   3. Pure-fetch probe: find orchestrator → read opencode port → scan ±50
+ *   4. Fallback to 3005
  *
  * Requires: OpenWork with Telegram connected (openwork.ai)
  */
 
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { basename } from "path";
+import { basename, join } from "path";
+import { homedir } from "os";
+import { readFileSync } from "fs";
 
 /** Quick HTTP health probe with a short timeout. Returns parsed JSON or null. */
 async function probe(port: number, path = "/health", timeoutMs = 250): Promise<any> {
@@ -37,7 +39,7 @@ async function probe(port: number, path = "/health", timeoutMs = 250): Promise<a
   }
 }
 
-/** Discover the OpenWork router port using only fetch (safe in Bun plugin sandbox). */
+/** Discover the OpenWork router port. */
 async function discoverRouterPort(): Promise<number> {
   // 1. Env var
   const fromEnv = process.env["OPENCODE_ROUTER_HEALTH_PORT"];
@@ -46,42 +48,50 @@ async function discoverRouterPort(): Promise<number> {
     if (Number.isFinite(p) && p > 0) return p;
   }
 
-  // 2. Find the orchestrator daemon (it exposes opencode's port in /health).
-  //    Then scan ±50 ports around opencode's port for the router.
-  //    Orchestrator candidates: env var, or scan a window of 20 ports around common values.
-  const orchCandidates = [54065, 54064, 54066, 54063, 54067, 3006, 3007, 3008];
-  const orchEnv = process.env["OPENWORK_DAEMON_PORT"];
-  if (orchEnv) {
-    const p = Number(orchEnv.trim());
-    if (Number.isFinite(p)) orchCandidates.unshift(p);
+  // 2. Port file written by router on startup
+  try {
+    const portFile = join(homedir(), ".openwork", "opencode-router", "port");
+    const contents = readFileSync(portFile, "utf8").trim();
+    const p = Number(contents);
+    if (Number.isFinite(p) && p > 0) return p;
+  } catch {
+    // file doesn't exist yet
   }
 
-  let opencodePort: number | null = null;
-  for (const p of orchCandidates) {
-    const body = await probe(p);
-    if (body?.daemon?.port === p && body?.opencode?.port) {
-      opencodePort = body.opencode.port as number;
-      break;
+  // 3. Pure-fetch probe: find orchestrator → read opencode port → scan ±50
+  try {
+    const orchCandidates = [54065, 54064, 54066, 54063, 54067, 3006, 3007, 3008];
+    const orchEnv = process.env["OPENWORK_DAEMON_PORT"];
+    if (orchEnv) {
+      const p = Number(orchEnv.trim());
+      if (Number.isFinite(p)) orchCandidates.unshift(p);
     }
-  }
 
-  if (opencodePort) {
-    // Scan ±50 ports around opencode port for the router health signature
-    const probes: Array<Promise<{ port: number; body: any }>> = [];
-    for (let i = -50; i <= 50; i++) {
-      const port = opencodePort + i;
-      probes.push(probe(port).then((body) => ({ port, body })));
-    }
-    const results = await Promise.all(probes);
-    for (const { port, body } of results) {
-      // Router health: { ok: true, channels: { telegram: bool, ... } }
-      if (body?.ok === true && body?.channels && typeof body.channels === "object") {
-        return port;
+    let opencodePort: number | null = null;
+    for (const p of orchCandidates) {
+      const body = await probe(p);
+      if (body?.daemon?.port === p && body?.opencode?.port) {
+        opencodePort = body.opencode.port as number;
+        break;
       }
     }
-  }
 
-  // 3. Fallback
+    if (opencodePort) {
+      const probes: Array<Promise<{ port: number; body: any }>> = [];
+      for (let i = -50; i <= 50; i++) {
+        const port = opencodePort + i;
+        probes.push(probe(port).then((body) => ({ port, body })));
+      }
+      const results = await Promise.all(probes);
+      for (const { port, body } of results) {
+        if (body?.ok === true && body?.channels && typeof body.channels === "object") {
+          return port;
+        }
+      }
+    }
+  } catch { /* ignore */ }
+
+  // 4. Fallback
   return 3005;
 }
 
