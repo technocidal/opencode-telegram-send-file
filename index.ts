@@ -72,7 +72,7 @@ async function getRouterChatId(directory: string): Promise<string | null> {
 export const TelegramSendFilePlugin: Plugin = async ({ directory }) => {
   return {
     tool: {
-      telegram_send_file: {
+      send_file_via_telegram: {
         description:
           "Send a local file (PDF, image, etc.) to the current Telegram chat. " +
           "The bot token and chat ID are resolved automatically from the OpenWork router.",

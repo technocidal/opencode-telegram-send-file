@@ -2,7 +2,7 @@
  * opencode-telegram-send-file — OpenWork extension format
  *
  * Drop this file into:
- *   ~/.openwork/openwork-orchestrator/opencode-config/tools/telegram_send_file.ts
+ *   ~/.openwork/openwork-orchestrator/opencode-config/tools/send_file_via_telegram.ts
  *
  * The OpenWork orchestrator loads it automatically — no config.json entry needed.
  *
