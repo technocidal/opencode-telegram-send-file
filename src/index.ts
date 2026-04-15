@@ -9,17 +9,16 @@
  * are all handled by the router.
  *
  * Port discovery order:
- *   1. OPENCODE_ROUTER_HEALTH_PORT env var (set when running inside the router process)
- *   2. Read from openwork-orchestrator-state.json (router port stored there)
- *   3. Scan the running opencode-router process's environment via `ps`
+ *   1. OPENCODE_ROUTER_HEALTH_PORT env var
+ *   2. Read from running opencode-router process env via pgrep + ps (two steps,
+ *      explicit shell to avoid subshell expansion issues in bundled context)
  *
  * Requires: OpenWork with Telegram connected (openwork.ai)
  */
 
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { basename, join } from "path";
-import { homedir } from "os";
+import { basename } from "path";
 import { execSync } from "child_process";
 
 /** Discover the OpenWork router port via multiple strategies. */
@@ -31,57 +30,32 @@ function discoverRouterPort(): number {
     if (Number.isFinite(p) && p > 0) return p;
   }
 
-  // 2. orchestrator state file — written by OpenWork daemon on startup
+  // 2. Two-step ps approach: pgrep first (no subshell expansion needed),
+  //    then ps on the PID directly. Explicit shell to ensure it works in
+  //    Bun's bundled ESM context.
   try {
-    const statePath = join(
-      homedir(),
-      ".openwork",
-      "openwork-orchestrator",
-      "openwork-orchestrator-state.json"
-    );
-    const raw = require("fs").readFileSync(statePath, "utf8");
-    const state = JSON.parse(raw);
-    // The router sidecar writes its port into the state under various keys.
-    // Walk all values looking for { port: number } entries that aren't
-    // the opencode or daemon ports we already know about.
-    const knownPorts = new Set([
-      state?.opencode?.port,
-      state?.daemon?.port,
-    ]);
-    function findRouterPort(obj: any): number | undefined {
-      if (!obj || typeof obj !== "object") return undefined;
-      if (typeof obj.port === "number" && !knownPorts.has(obj.port)) {
-        // Quick health-check to confirm it's the router
-        return obj.port;
+    const pid = execSync("pgrep -f opencode-router 2>/dev/null | head -1", {
+      encoding: "utf8",
+      timeout: 2000,
+      shell: "/bin/sh",
+    }).trim();
+    if (pid) {
+      const output = execSync(`ps eww ${pid}`, {
+        encoding: "utf8",
+        timeout: 2000,
+        shell: "/bin/sh",
+      });
+      const match = output.match(/OPENCODE_ROUTER_HEALTH_PORT=(\d+)/);
+      if (match) {
+        const p = Number(match[1]);
+        if (Number.isFinite(p) && p > 0) return p;
       }
-      for (const v of Object.values(obj)) {
-        const found = findRouterPort(v);
-        if (found !== undefined) return found;
-      }
-      return undefined;
-    }
-    const statePort = findRouterPort(state);
-    if (statePort) return statePort;
-  } catch {
-    // ignore — file may not exist yet
-  }
-
-  // 3. Read port from the running opencode-router process environment via ps
-  try {
-    const output = execSync(
-      "ps eww $(pgrep -f opencode-router 2>/dev/null | head -1) 2>/dev/null",
-      { encoding: "utf8", timeout: 3000 }
-    );
-    const match = output.match(/OPENCODE_ROUTER_HEALTH_PORT=(\d+)/);
-    if (match) {
-      const p = Number(match[1]);
-      if (Number.isFinite(p) && p > 0) return p;
     }
   } catch {
-    // ignore
+    // ignore — ps may not be available or router not running
   }
 
-  // 4. Fallback — default port used in development
+  // 3. Fallback — default port used in development
   return 3005;
 }
 
