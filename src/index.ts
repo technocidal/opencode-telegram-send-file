@@ -8,10 +8,11 @@
  * Zero config — binding resolution, retry logic, and multi-identity fan-out
  * are all handled by the router.
  *
- * Port discovery order:
+ * Port discovery (pure fetch, no child_process — works in Bun plugin sandbox):
  *   1. OPENCODE_ROUTER_HEALTH_PORT env var
- *   2. Read from running opencode-router process env via pgrep + ps (two steps,
- *      explicit shell to avoid subshell expansion issues in bundled context)
+ *   2. Discover orchestrator port, read its opencode port, then probe
+ *      a ±50 window for a host with router-shaped /health response
+ *   3. Fallback to 3005
  *
  * Requires: OpenWork with Telegram connected (openwork.ai)
  */
@@ -19,43 +20,68 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { basename } from "path";
-import { execSync } from "child_process";
 
-/** Discover the OpenWork router port via multiple strategies. */
-function discoverRouterPort(): number {
-  // 1. Env var — set when opencode itself is launched with the router
+/** Quick HTTP health probe with a short timeout. Returns parsed JSON or null. */
+async function probe(port: number, path = "/health", timeoutMs = 250): Promise<any> {
+  try {
+    const r = await Promise.race([
+      fetch(`http://127.0.0.1:${port}${path}`),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("timeout")), timeoutMs)
+      ),
+    ]) as Response;
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+/** Discover the OpenWork router port using only fetch (safe in Bun plugin sandbox). */
+async function discoverRouterPort(): Promise<number> {
+  // 1. Env var
   const fromEnv = process.env["OPENCODE_ROUTER_HEALTH_PORT"];
   if (fromEnv) {
     const p = Number(fromEnv.trim());
     if (Number.isFinite(p) && p > 0) return p;
   }
 
-  // 2. Two-step ps approach: pgrep first (no subshell expansion needed),
-  //    then ps on the PID directly. Explicit shell to ensure it works in
-  //    Bun's bundled ESM context.
-  try {
-    const pid = execSync("pgrep -f opencode-router 2>/dev/null | head -1", {
-      encoding: "utf8",
-      timeout: 2000,
-      shell: "/bin/sh",
-    }).trim();
-    if (pid) {
-      const output = execSync(`ps eww ${pid}`, {
-        encoding: "utf8",
-        timeout: 2000,
-        shell: "/bin/sh",
-      });
-      const match = output.match(/OPENCODE_ROUTER_HEALTH_PORT=(\d+)/);
-      if (match) {
-        const p = Number(match[1]);
-        if (Number.isFinite(p) && p > 0) return p;
-      }
-    }
-  } catch {
-    // ignore — ps may not be available or router not running
+  // 2. Find the orchestrator daemon (it exposes opencode's port in /health).
+  //    Then scan ±50 ports around opencode's port for the router.
+  //    Orchestrator candidates: env var, or scan a window of 20 ports around common values.
+  const orchCandidates = [54065, 54064, 54066, 54063, 54067, 3006, 3007, 3008];
+  const orchEnv = process.env["OPENWORK_DAEMON_PORT"];
+  if (orchEnv) {
+    const p = Number(orchEnv.trim());
+    if (Number.isFinite(p)) orchCandidates.unshift(p);
   }
 
-  // 3. Fallback — default port used in development
+  let opencodePort: number | null = null;
+  for (const p of orchCandidates) {
+    const body = await probe(p);
+    if (body?.daemon?.port === p && body?.opencode?.port) {
+      opencodePort = body.opencode.port as number;
+      break;
+    }
+  }
+
+  if (opencodePort) {
+    // Scan ±50 ports around opencode port for the router health signature
+    const probes: Array<Promise<{ port: number; body: any }>> = [];
+    for (let i = -50; i <= 50; i++) {
+      const port = opencodePort + i;
+      probes.push(probe(port).then((body) => ({ port, body })));
+    }
+    const results = await Promise.all(probes);
+    for (const { port, body } of results) {
+      // Router health: { ok: true, channels: { telegram: bool, ... } }
+      if (body?.ok === true && body?.channels && typeof body.channels === "object") {
+        return port;
+      }
+    }
+  }
+
+  // 3. Fallback
   return 3005;
 }
 
@@ -80,7 +106,7 @@ const TelegramSendFilePlugin: Plugin = async (ctx) => {
         execute: async ({ filePath, caption }) => {
           // Read directory lazily at call time, not at plugin load time
           const directory = ctx?.directory;
-          const port = discoverRouterPort();
+          const port = await discoverRouterPort();
           const url = `http://127.0.0.1:${port}/send`;
 
           const fileName = basename(filePath);
