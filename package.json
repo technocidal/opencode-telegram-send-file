@@ -14,6 +14,10 @@
   ],
   "author": "technocidal",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/technocidal/opencode-telegram-send-file"
+  },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.2.0",
     "zod": ">=3.0.0"
