@@ -3,151 +3,82 @@
  *
  * OpenCode plugin that adds a `telegram_send_file` tool.
  * Sends any local file (PDF, image, etc.) to the current Telegram chat
- * via your OpenWork messaging integration.
+ * via the OpenWork router's /send endpoint.
  *
- * Zero config — the bot token and chat ID are resolved automatically
- * from the OpenWork router's own config and database:
- *
- *   Token:   ~/.openwork/opencode-router/opencode-router.json
- *   Chat ID: ~/.openwork/opencode-router/opencode-router.db (bindings table)
+ * Zero config — binding resolution, retry logic, and multi-identity fan-out
+ * are all handled by the router. The plugin only needs to know the router's
+ * health-server port (OPENCODE_ROUTER_HEALTH_PORT, default 3005).
  *
  * Requires: OpenWork with Telegram connected (openwork.ai)
  */
 
 import type { Plugin } from "@opencode-ai/plugin";
-import { z } from "zod";
-import { readFile } from "fs/promises";
-import { basename, join } from "path";
-import { homedir } from "os";
-
-const ROUTER_CONFIG_PATH = join(
-  homedir(),
-  ".openwork",
-  "opencode-router",
-  "opencode-router.json"
-);
-
-const ROUTER_DB_PATH = join(
-  homedir(),
-  ".openwork",
-  "opencode-router",
-  "opencode-router.db"
-);
-
-/** Read the bot token for a given workspace directory from the router config. */
-async function getRouterBotToken(directory: string): Promise<string | null> {
-  try {
-    const raw = await readFile(ROUTER_CONFIG_PATH, "utf8");
-    const config = JSON.parse(raw) as any;
-    const bots: any[] = config?.channels?.telegram?.bots ?? [];
-    const bot = bots.find((b) => b.directory === directory && b.enabled);
-    return bot?.token ?? null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Read the most recent peer_id (Telegram chat ID) for a given workspace
- * directory from the router's SQLite bindings table.
- *
- * Uses Bun's built-in SQLite driver (available in the OpenCode runtime).
- */
-async function getRouterChatId(directory: string): Promise<string | null> {
-  try {
-    const { Database } = await import("bun:sqlite");
-    const db = new Database(ROUTER_DB_PATH, { readonly: true });
-    const row = db
-      .query<{ peer_id: string }, [string]>(
-        "SELECT peer_id FROM bindings WHERE channel = 'telegram' AND directory = ? ORDER BY updated_at DESC LIMIT 1"
-      )
-      .get(directory);
-    db.close();
-    return row?.peer_id ?? null;
-  } catch {
-    return null;
-  }
-}
+import { tool } from "@opencode-ai/plugin";
+import { basename } from "path";
 
 export const TelegramSendFilePlugin: Plugin = async ({ directory }) => {
   return {
     tool: {
-      send_file_via_telegram: {
+      telegram_send_file: tool({
         description:
           "Send a local file (PDF, image, etc.) to the current Telegram chat. " +
-          "The bot token and chat ID are resolved automatically from the OpenWork router.",
-        parameters: z.object({
-          filePath: z
+          "Delegates to the OpenWork router — binding resolution and delivery are handled automatically.",
+        args: {
+          filePath: tool.schema
             .string()
             .describe("Absolute path to the file to send"),
-          caption: z
+          caption: tool.schema
             .string()
             .optional()
             .describe("Optional caption to accompany the file"),
-        }),
+        },
         execute: async ({ filePath, caption }) => {
-          const token = await getRouterBotToken(directory);
-          if (!token) {
-            return (
-              "❌ Could not find a Telegram bot token for this workspace in the OpenWork router config. " +
-              "Make sure Telegram is connected in OpenWork settings."
-            );
-          }
-
-          const chatId = await getRouterChatId(directory);
-          if (!chatId) {
-            return (
-              "❌ No Telegram binding found for this workspace. " +
-              "The recipient must message the bot first (e.g. with /start), then retry."
-            );
-          }
-
-          let fileBuffer: Buffer;
-          try {
-            fileBuffer = await readFile(filePath);
-          } catch (err: any) {
-            return `❌ Could not read file at "${filePath}": ${err.message}`;
-          }
+          const port = process.env["OPENCODE_ROUTER_HEALTH_PORT"] ?? "3005";
+          const url = `http://127.0.0.1:${port}/send`;
 
           const fileName = basename(filePath);
 
-          const formData = new FormData();
-          formData.append("chat_id", chatId);
-          formData.append(
-            "document",
-            new Blob([fileBuffer], { type: "application/octet-stream" }),
-            fileName
-          );
+          const part: Record<string, string> = {
+            type: "file",
+            filePath,
+            filename: fileName,
+          };
           if (caption) {
-            formData.append("caption", caption);
+            part["caption"] = caption;
           }
 
           let response: Response;
           try {
-            response = await fetch(
-              `https://api.telegram.org/bot${token}/sendDocument`,
-              { method: "POST", body: formData }
-            );
+            response = await fetch(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                channel: "telegram",
+                directory,
+                parts: [part],
+              }),
+            });
           } catch (err: any) {
-            return `❌ Network error while contacting Telegram: ${err.message}`;
+            return (
+              `❌ Could not reach the OpenWork router at ${url}: ${err.message}\n` +
+              "Make sure OpenWork is running and the router is connected."
+            );
           }
 
-          const body = (await response.json()) as any;
-
-          if (!response.ok || !body.ok) {
-            const errDesc: string = body?.description ?? response.statusText;
-            if (errDesc.toLowerCase().includes("chat not found")) {
-              return (
-                "❌ Chat not found. The recipient must message the bot first " +
-                "(e.g. with /start), then retry."
-              );
+          if (!response.ok) {
+            let detail = response.statusText;
+            try {
+              const body = (await response.json()) as any;
+              detail = body?.error ?? body?.message ?? detail;
+            } catch {
+              // ignore parse error — use statusText
             }
-            return `❌ Telegram error: ${errDesc}`;
+            return `❌ Router returned ${response.status}: ${detail}`;
           }
 
           return `✅ "${fileName}" sent successfully via Telegram.`;
         },
-      },
+      }),
     },
   };
 };
