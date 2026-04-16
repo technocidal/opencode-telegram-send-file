@@ -1,7 +1,7 @@
 {
   "name": "opencode-telegram-send-file",
   "version": "1.0.13",
-  "description": "OpenCode plugin that adds a telegram_send_file tool — send any local file to Telegram via your OpenWork messaging integration, zero config required.",
+  "description": "OpenCode plugin that adds a telegram_send_file tool — send files and photos to Telegram via OpenWork. Images are sent with inline preview (sendPhoto); other files as attachments (sendDocument). Zero config.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",
@@ -26,6 +26,8 @@
     "plugin",
     "telegram",
     "file",
+    "photo",
+    "image",
     "send"
   ],
   "author": "technocidal",
