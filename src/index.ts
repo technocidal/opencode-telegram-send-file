@@ -5,6 +5,9 @@
  * Sends any local file (PDF, image, etc.) directly to Telegram via the Bot API —
  * no router dependency, no port discovery needed.
  *
+ * Image files (JPEG, PNG, GIF, WEBP) are sent via sendPhoto for inline preview.
+ * All other files (PDF, etc.) are sent via sendDocument as attachments.
+ *
  * Config is read from:
  *   ~/.openwork/opencode-router/opencode-router.json  → bot token
  *   ~/.openwork/opencode-router/opencode-router.db    → chat ID (bindings table)
@@ -12,13 +15,16 @@
 
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { basename, join } from "path";
+import { basename, extname, join } from "path";
 import { homedir } from "os";
 import { readFileSync } from "fs";
 import { Database } from "bun:sqlite";
 
 const CONFIG_PATH = join(homedir(), ".openwork", "opencode-router", "opencode-router.json");
 const DB_PATH = join(homedir(), ".openwork", "opencode-router", "opencode-router.db");
+
+/** Extensions that Telegram can preview inline via sendPhoto. */
+const PHOTO_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
 
 interface BotConfig {
   token: string;
@@ -45,7 +51,6 @@ function getBotToken(directory: string): string {
   const bots = config?.channels?.telegram?.bots ?? [];
   const bot = bots.find((b) => b.enabled && b.directory === directory);
   if (!bot) {
-    // Fall back to the first enabled bot if directory doesn't match exactly
     const fallback = bots.find((b) => b.enabled);
     if (!fallback) throw new Error("No enabled Telegram bot found in OpenWork router config.");
     return fallback.token;
@@ -86,7 +91,9 @@ const TelegramSendFilePlugin: Plugin = async (ctx) => {
       telegram_send_file: tool({
         description:
           "Send a local file (PDF, image, etc.) to the current Telegram chat. " +
-          "Delegates to the OpenWork router — binding resolution and delivery are handled automatically.",
+          "Images (JPEG, PNG, GIF, WEBP) are sent as inline photos with preview. " +
+          "All other files are sent as document attachments. " +
+          "Binding resolution is handled automatically from the OpenWork router config.",
         args: {
           filePath: tool.schema.string().describe("Absolute path to the file to send"),
           caption: tool.schema.string().optional().describe("Optional caption to accompany the file"),
@@ -105,6 +112,9 @@ const TelegramSendFilePlugin: Plugin = async (ctx) => {
           }
 
           const fileName = basename(filePath);
+          const ext = extname(fileName).toLowerCase();
+          const isPhoto = PHOTO_EXTENSIONS.has(ext);
+
           let fileBuffer: Buffer;
           try {
             fileBuffer = readFileSync(filePath);
@@ -114,14 +124,20 @@ const TelegramSendFilePlugin: Plugin = async (ctx) => {
 
           const form = new FormData();
           form.append("chat_id", chatId);
-          form.append("document", new Blob([fileBuffer]), fileName);
+          if (isPhoto) {
+            form.append("photo", new Blob([fileBuffer]), fileName);
+          } else {
+            form.append("document", new Blob([fileBuffer]), fileName);
+          }
           if (caption) {
             form.append("caption", caption);
           }
 
+          const endpoint = isPhoto ? "sendPhoto" : "sendDocument";
+
           let response: Response;
           try {
-            response = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+            response = await fetch(`https://api.telegram.org/bot${token}/${endpoint}`, {
               method: "POST",
               body: form,
             });
@@ -140,7 +156,7 @@ const TelegramSendFilePlugin: Plugin = async (ctx) => {
             return `❌ Telegram API returned ${response.status}: ${detail}`;
           }
 
-          return `✅ "${fileName}" sent successfully via Telegram.`;
+          return `✅ "${fileName}" sent successfully via Telegram${isPhoto ? " (photo preview)" : ""}.`;
         },
       }),
     },
